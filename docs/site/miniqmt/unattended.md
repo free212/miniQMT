@@ -101,6 +101,18 @@ get_leaked_call_count()    # 累计泄漏的超时调用数
 
 ---
 
+### 开盘期间总资产双源监控
+
+实盘 xttrader 直连模式在连续交易时段每隔约 10 秒核对一次总资产，检查位于持仓监控的交易信号处理之前：
+
+`偏差比例 = |xttrader 总资产 -（账户可用金额 + Σ持仓总股数 × 当前行情价）| / xttrader 总资产`
+
+偏差严格大于 `ASSET_CONSISTENCY_MAX_DEVIATION_RATIO = 0.03` 时，记录 `[ASSET_CONSISTENCY]` ERROR，包含两路总资产、差额和比例，标记 `qmt_connected=False` 并进入已有重连流程；本轮不再检测交易信号。查询有返回不能直接解除该异常，须有新的有效核对结果回到阈值内。持续异常日志沿用 `LOG_THROTTLE_INTERVAL` 降噪。
+
+核对使用持仓**总数量**和缓存的实时行情，不使用柜台持仓市值；按此口径不计冻结现金。行情须覆盖全部持仓且来源时间有效，行情或持仓快照过期时提示“暂无法核对”，保留已有异常状态。模拟模式、午休/盘后及 XtQuantManager/IPC/RPC 后端不执行该检查。
+
+配置集中于 `config.py`：核对间隔 `ASSET_CONSISTENCY_CHECK_INTERVAL_SECONDS = 10.0`，证据有效期复用 `ASSET_VALUATION_MAX_AGE_SECONDS = 60`。无需打开原有资产恒等式告警开关。
+
 ## 非交易时段优化
 
 ```python

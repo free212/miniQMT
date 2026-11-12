@@ -707,6 +707,8 @@ SETTLEMENT_ASSET_IDENTITY_TOLERANCE = 1.0
 # 重新开启会把 WARNING 日志与 run_events(asset_identity_mismatch, ERROR) 一并恢复。
 ENABLE_ASSET_IDENTITY_ALERT = False
 ASSET_VALUATION_MAX_AGE_SECONDS = 60  # 盘中资产、持仓及行情快照允许的最大年龄（秒）
+ASSET_CONSISTENCY_MAX_DEVIATION_RATIO = 0.03  # 两路总资产差额占 xttrader 总资产超过 3% 时标记连接异常
+ASSET_CONSISTENCY_CHECK_INTERVAL_SECONDS = 10.0  # 连续交易时段总资产核对间隔（秒）
 GRID_ORDER_AMOUNT_TOLERANCE = 0.01  # 修复订单错误时双账本成交金额的核对容差（元）
 SETTLEMENT_ASSET_RECHECK_COUNT = 1  # 净值恒等式异常时最多额外查询一次
 SETTLEMENT_ASSET_RECHECK_DELAY_SECONDS = 0.2  # 等待 QMT 估值字段同步

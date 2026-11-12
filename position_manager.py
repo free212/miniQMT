@@ -8,6 +8,7 @@ from datetime import datetime
 import time
 import threading
 import logging
+import math
 import concurrent.futures
 import sys
 import os
@@ -243,6 +244,8 @@ class PositionManager:
         self._last_reconnect_time = 0.0  # 上次重连时间戳，用于冷却保护
         self._reconnect_in_progress = False  # 防止并发重连/连接
         self._reconnect_thread = None  # 记录后台重连线程（仅用于诊断）
+        self._asset_monitor_last_check = None
+        self._asset_monitor_abnormal = False  # 与重连状态共用 _reconnect_lock 保护
 
 
     def check_qmt_connection_health(self):
@@ -321,7 +324,8 @@ class PositionManager:
                     success = bool(self.qmt_trader.reconnect_xttrader())
 
                 if success:
-                    self.qmt_connected = True
+                    with self._reconnect_lock:
+                        self.qmt_connected = not getattr(self, '_asset_monitor_abnormal', False)
                     # 重新注册成交回报回调
                     try:
                         self.qmt_trader.register_trade_callback(self._on_trade_callback)
@@ -345,7 +349,8 @@ class PositionManager:
                     # 不置零则 get_all_positions() 最长 QMT_POSITION_QUERY_INTERVAL(10秒) 内
                     # 继续返回断连前的缓存快照，止盈止损会基于错误持仓判断。
                     self.last_position_update_time = 0
-                    logger.info(f'[RECONNECT] QMT {("连接" if mode=="connect" else "重连")}成功，恢复正常运行')
+                    recovery_status = '恢复正常运行' if self.qmt_connected else '等待总资产核对恢复'
+                    logger.info(f'[RECONNECT] QMT {("连接" if mode=="connect" else "重连")}成功，{recovery_status}')
                 else:
                     self.qmt_connected = False
                     logger.error(f'[RECONNECT] QMT {("连接" if mode=="connect" else "重连")}失败')
@@ -415,14 +420,14 @@ class PositionManager:
         不能用「持仓查询返回空」当依据——position() 在断连时同样返回空 DataFrame，
         与「真的没有持仓」无法区分，据此自恢复会造成假健康。
 
-        重连进行中时一律返回 False，避免与 _start_qmt_connect_worker 抢着改 qmt_connected。
+        重连进行中或总资产核对仍异常时返回 False，避免查询有返回就误判恢复。
         """
         if config.ENABLE_SIMULATION_MODE:
             return False
         if getattr(config, 'ENABLE_XTQUANT_MANAGER', False):
             return False
         with self._reconnect_lock:
-            if self._reconnect_in_progress:
+            if self._reconnect_in_progress or getattr(self, '_asset_monitor_abnormal', False):
                 return False
         trader = self.qmt_trader
         if trader is None or not hasattr(trader, 'ping_xttrader'):
@@ -2443,6 +2448,69 @@ class PositionManager:
             logger.debug(f"账户估值证据暂不可用: {exc}")
             return dict(status='unavailable', reason='账户估值证据暂不可用',
                         quote_market_value=None)
+
+    def _monitor_total_asset_consistency(self):
+        """连续交易时段用可用现金加实时持仓市值核对柜台总资产。"""
+        if (config.ENABLE_SIMULATION_MODE or config.ENABLE_XTQUANT_MANAGER
+                or config.ENABLE_QMT_IPC_FALLBACK or config.ENABLE_QMT_RPC_FALLBACK
+                or not config.is_continuous_trade_time()):
+            return True
+
+        with self._reconnect_lock:
+            abnormal = getattr(self, '_asset_monitor_abnormal', False)
+            now = time.monotonic()
+            last_check = getattr(self, '_asset_monitor_last_check', None)
+            if (self._reconnect_in_progress or
+                    (last_check is not None and now - last_check <
+                     config.ASSET_CONSISTENCY_CHECK_INTERVAL_SECONDS)):
+                if abnormal:
+                    self.qmt_connected = False
+                return not abnormal
+            self._asset_monitor_last_check = now
+
+        try:
+            account = self.get_account_info() or {}
+            valuation = account.get('valuation') or {}
+            if valuation.get('status') in ('unavailable', 'static'):
+                raise ValueError(valuation.get('reason', '估值证据不可用'))
+            total = float(account['total_asset'])
+            cash = float(account['available'])
+            market_value = float(valuation['quote_market_value'])
+            if (not all(math.isfinite(value) for value in (total, cash, market_value))
+                    or total <= 0 or cash < 0 or market_value < 0):
+                raise ValueError('资产金额无效')
+        except (KeyError, TypeError, ValueError) as exc:
+            log_throttled(logger, logging.WARNING, 'asset_consistency_unavailable',
+                          f'[ASSET_CONSISTENCY] 暂无法核对总资产: {exc}')
+            with self._reconnect_lock:
+                abnormal = getattr(self, '_asset_monitor_abnormal', False)
+                if abnormal:
+                    self.qmt_connected = False
+                return not abnormal
+
+        estimated = cash + market_value
+        deviation = abs(total - estimated) / total
+        threshold = config.ASSET_CONSISTENCY_MAX_DEVIATION_RATIO
+        abnormal = deviation > threshold
+        with self._reconnect_lock:
+            was_abnormal = getattr(self, '_asset_monitor_abnormal', False)
+            self._asset_monitor_abnormal = abnormal
+            if abnormal:
+                self.qmt_connected = False
+        reset_log_throttle('asset_consistency_unavailable')
+        if abnormal:
+            log_throttled(
+                logger, logging.ERROR, 'asset_consistency_mismatch',
+                f'[ASSET_CONSISTENCY] xttrader连接异常: 柜台总资产={total:.2f}, '
+                f'可用金额={cash:.2f}, 行情持仓市值={market_value:.2f}, '
+                f'重算总资产={estimated:.2f}, 差额={total - estimated:.2f}, '
+                f'偏差={deviation:.2%}, 阈值={threshold:.2%}, '
+                f'行情时间={valuation.get("quote_asof")}, 已标记断连并等待恢复')
+        else:
+            reset_log_throttle('asset_consistency_mismatch')
+            if was_abnormal:
+                logger.info(f'[ASSET_CONSISTENCY] 总资产核对恢复: 偏差={deviation:.2%}')
+        return not abnormal
 
     def get_account_info(self):
         """获取账户信息"""
@@ -5084,9 +5152,10 @@ class PositionManager:
                 try:
                     timeout = config.MONITOR_CALL_TIMEOUT
                     positions_df = run_with_timeout(self.get_all_positions, timeout)
+                    asset_consistent = run_with_timeout(self._monitor_total_asset_consistency, timeout)
 
-                    if not config.ENABLE_SIMULATION_MODE and not self.qmt_connected:
-                        # qmt_connected=False 由 on_disconnected 立即设置，说明 QMT 进程已断连。
+                    if not config.ENABLE_SIMULATION_MODE and (not self.qmt_connected or not asset_consistent):
+                        # 断连回调或总资产核对异常均可触发保护，缓存读取成功不代表恢复。
                         # get_all_positions() 内部吞掉了 qmt_trader.position() 的异常，
                         # 返回的是旧缓存数据——不能视为真实成功，也不能将 qmt_connected 翻回 True。
                         #

@@ -210,7 +210,8 @@
         "test.test_trade_calendar",
         "test.test_runtime_logging",
         "test.test_runtime_log_regression",
-        "test.test_runtime_optimization"
+        "test.test_runtime_optimization",
+        "test.test_asset_consistency_monitor"
       ],
       "priority": "critical"
     },
